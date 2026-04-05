@@ -1,0 +1,3 @@
+# This directory is populated by download-toolkit.sh
+# Contains: busybox, toolkit.tar.gz, _deploy.sh
+# Do NOT commit binaries — they're downloaded at runtime

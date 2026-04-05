@@ -1,0 +1,6 @@
+# Ignore downloaded binaries and generated archives
+serve/busybox
+serve/toolkit.tar.gz
+serve/_deploy.sh
+bin/busybox
+bin/_deploy.sh
