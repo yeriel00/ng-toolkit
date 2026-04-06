@@ -344,15 +344,17 @@ local function setup_captive_portal()
   exec(bb .. " httpd -p 443 -h /tmp/www -c /dev/null 2>/dev/null")
   log("httpd on port 443 (HTTPS fast-fail)")
 
-  -- Create OS captive portal detection trigger files
-  -- Return wrong content so OS detects portal and auto-pops
+  -- Copy portal page to all OS captive portal detection paths
   for _, fname in ipairs({
     "hotspot-detect.html", "generate_204",
-    "connecttest.txt", "canonical.html", "success.txt"
+    "connecttest.txt", "canonical.html", "success.txt", "ncsi.txt"
   }) do
-    exec("printf 'portal' > /tmp/www/" .. fname)
+    exec("cp /tmp/www/index.html /tmp/www/" .. fname)
   end
-  log("Portal detection files created (Apple/Android/Win/FF)")
+  -- Chrome/Android alternate path
+  exec("mkdir -p /tmp/www/gen_204")
+  exec("cp /tmp/www/index.html /tmp/www/gen_204/index.html")
+  log("Portal page copied to all detection paths (Apple/Android/Win/FF/Chrome)")
 
   -- ---------------------------------------------------------------
   -- DNS HIJACK — dnsmasq with config file (avoids ash ~80 char truncation)
